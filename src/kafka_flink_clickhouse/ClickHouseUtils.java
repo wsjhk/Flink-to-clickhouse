@@ -23,9 +23,9 @@ public class ClickHouseUtils {
 //        private static Connection connection = null;
 //        try {
 //            Class.forName("ru.yandex.clickhouse.ClickHouseDriver");
-//            String url = "jdbc:clickhouse://clickhouse.xpu.xiaopeng.local:80/kafka";
+//            String url = "jdbc:clickhouse://clickhouse:8123/kafka";
 //            String user = "clickhouse";
-//            String password = "Xpu#Clickhouse@@2022";
+//            String password = "xxx";
 //            connection = DriverManager.getConnection(url, user, password);
 //        } catch (Exception e) {
 //            e.printStackTrace();
