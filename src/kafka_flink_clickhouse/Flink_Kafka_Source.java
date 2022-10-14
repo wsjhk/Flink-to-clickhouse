@@ -11,6 +11,7 @@ import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 
 
@@ -18,8 +19,7 @@ public class Flink_Kafka_Source {
     public static void main(String[] args) throws Exception {
         ParameterTool parameterTool = ParameterTool.fromArgs(args);
         String kafka = parameterTool.get("kafka");
-        String topic = parameterTool.get("topic");
-//        ArrayList<String> topics = (ArrayList<String>) Arrays.asList(parameterTool.get("topics").split(","));
+        List<String> topics = new ArrayList<>(Arrays.asList(parameterTool.get("topics").split(",")));
         String ck_host = parameterTool.get("ck_host");
         String db = parameterTool.get("db");
         String username = parameterTool.get("username");
@@ -41,7 +41,7 @@ public class Flink_Kafka_Source {
         prop.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
         prop.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
         FlinkKafkaConsumer<String> kafkaSource = new FlinkKafkaConsumer<String>(
-                topic,
+                topics,
                 new SimpleStringSchema(), // 这里可以使用自定义序列化获取kafka的topic，partition，offset等元数据信息和消息的详细内容
                 prop
         );
@@ -68,9 +68,9 @@ public class Flink_Kafka_Source {
         });
 
         // add Sink
-        transformDS.addSink(new ClickHouseSqlSink(topic, ck_host, db, username, password));
+        transformDS.addSink(new ClickHouseSqlSink(ck_host, db, username, password));
 //        transformDS.print();
 
-        streamEnv.execute("Flink Log-System Job: " + topic);
+        streamEnv.execute("Flink Log-System Job: " + topics);
     }
 }

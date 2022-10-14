@@ -1,6 +1,5 @@
 package kafka_flink_clickhouse;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -9,26 +8,149 @@ import org.apache.flink.runtime.state.FunctionInitializationContext;
 import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.util.ArrayList;
-import java.util.Map;
+
+import java.sql.*;
+import java.sql.Date;
+import java.text.SimpleDateFormat;
+import java.util.*;
 
 
 public class ClickHouseSqlSink extends RichSinkFunction<String> implements CheckpointedFunction {
     private PreparedStatement ps;
     private Connection connection;
-    private int i, j, k;
+    private int i;
     private static final int count = 100000;
-    private String _topic, _ck_host, _db, _username, _password;
-//    private ArrayList<String> _topics;
+    private final String _ck_host, _db, _username, _password;
+    private final String[] meta_columns = {"_time","zone","cluster","log_format","log_type","instance"};
 
-    ClickHouseSqlSink(String topic, String ck_host, String db, String username, String password){
-        this._topic = topic;
+    ClickHouseSqlSink(String ck_host, String db, String username, String password){
         this._ck_host = ck_host;
         this._db = db;
         this._username = username;
         this._password = password;
+    }
+
+    public boolean checkTable(String t_name) throws Exception {
+        boolean rs = false;
+        String checkSql = "show tables like '" + t_name + "';";
+//        System.out.println(checkSql);
+        if (connection.createStatement().executeQuery(checkSql).next()) {
+            rs = true;
+        }
+
+        return rs;
+    }
+
+    public String[] queryColumns(String t_name) throws Exception {
+        String querySql = "select * from " + t_name + " limit 1";
+//        System.out.println(querySql);
+        ResultSet rs = connection.createStatement().executeQuery(querySql);
+        ResultSetMetaData rss = rs.getMetaData();
+        int columnCount = rss.getColumnCount();
+        String[] orgTabCols = new String[columnCount];
+        for (int i = 1; i <= columnCount; ++i) {
+            orgTabCols[i-1] = rss.getColumnName(i);
+//            System.out.println(orgTabCols[i-1]);
+        }
+        return orgTabCols;
+    }
+
+    public void createTableandView(String t_name, String[] columns) throws Exception {
+        String createtableSql = "create table if not exists " + t_name + " \n" +
+                "(\n" +
+                "    `_time` DateTime64(3) CODEC(DoubleDelta, LZ4),\n" +
+                "    `zone` LowCardinality(String),\n" +
+                "    `cluster` LowCardinality(String),\n" +
+                "    `log_format` Int8,\n" +
+                "    `log_type` LowCardinality(String) CODEC(ZSTD(1)),\n" +
+                "    `instance` LowCardinality(String) CODEC(ZSTD(1)),\n" +
+                "    `string.keys` Array(String) CODEC(ZSTD(1)),\n" +
+                "    `string.values`  Array(String) CODEC(ZSTD(1))\n" +
+//                "    PROJECTION p_clusters_usually (SELECT cluster, count(), min(_time), max(_time), groupUniqArrayArray(string.keys)GROUP BY cluster)\n" +
+                ")\n" +
+                "ENGINE = MergeTree\n" +
+                "PARTITION BY toYYYYMMDD(_time)\n" +
+                "ORDER BY _time\n" +
+                "TTL toDateTime(_time) + toIntervalDay(3) DELETE;";
+//        System.out.println(createtableSql);
+        StringBuilder subsql= new StringBuilder();
+        for (String column : columns) {
+//            System.out.println(column);
+            if (!Arrays.asList(meta_columns).contains(column)) {
+                subsql.append("string.values[indexOf(string.keys,'").append(column).append("')] as ").append(column.replace("@","")).append(",");
+            }
+        }
+        String createviewSql = "CREATE MATERIALIZED VIEW " + t_name + "_view \n" +
+                "ENGINE = MergeTree\n" +
+                "ORDER BY _time\n" +
+                "TTL toDateTime(_time) + toIntervalDay(180) DELETE\n" +
+                "AS SELECT\n" +
+                "  _time,\n" +
+                "  zone,\n" +
+                "  cluster,\n" +
+                "  log_format,\n" +
+                "  log_type,\n" +
+                "  instance,\n" +
+                subsql.deleteCharAt(subsql.length() - 1) + "\n" +
+                "FROM "+ _db + "." + t_name + ";";
+//        System.out.println(createviewSql);
+        connection.createStatement().executeUpdate(createtableSql);
+        connection.createStatement().executeUpdate(createviewSql);
+    }
+
+    public void updatedView(String t_name, String[] orgin_columns, String[] add_columns) throws Exception {
+        StringBuilder subsql= new StringBuilder();
+        for(String orgin_column : orgin_columns){
+            if (!Arrays.asList(meta_columns).contains(orgin_column)) {
+                subsql.append("string.values[indexOf(string.keys,'").append(orgin_column).append("')] as ").append(orgin_column).append(",");
+            }
+        }
+        for(String add_column : add_columns){
+            if (!Arrays.asList(meta_columns).contains(add_column)) {
+                connection.createStatement().executeUpdate("alter table `.inner." + t_name + "_view` add column " + add_column + " String;");
+                subsql.append("string.values[indexOf(string.keys,'").append(add_column).append("')] as ").append(add_column).append(",");
+            }
+        }
+        String updateviewSql = "ATTACH MATERIALIZED VIEW " + t_name + "_view \n" +
+                "ENGINE = MergeTree\n" +
+                "ORDER BY _time\n" +
+                "TTL toDateTime(_time) + toIntervalDay(180) DELETE\n" +
+                "AS SELECT\n" +
+                "  _time,\n" +
+                "  zone,\n" +
+                "  cluster,\n" +
+                "  log_format,\n" +
+                "  log_type,\n" +
+                "  instance,\n" +
+                subsql.deleteCharAt(subsql.length() - 1) + "\n" +
+                "FROM "+ _db + "." + t_name + ";";
+        System.out.println(updateviewSql);
+        connection.createStatement().executeUpdate("detach table " + t_name + "_view;");
+        connection.createStatement().executeUpdate(updateviewSql);
+    }
+
+    public String[] arraySubtract(String[] new_columns, String[] org_columns) {
+        ArrayList<String> list = new ArrayList<String>();
+        //选出属于数组new_columns但不属于数组org_columns的元素
+        for (String new_column : new_columns) {
+            boolean bContained = false;
+            for (String org_column : org_columns) {
+                if (Objects.equals(new_column, org_column)) {
+                    bContained = true;
+                    break;
+                }
+            }
+            if (!bContained) {
+                list.add(new_column);
+            }
+        }
+
+        String[] add_columns = new String[list.size()];
+        for(int i = 0; i < list.size(); ++i) {
+            add_columns[i] = list.get(i);
+            System.out.println(add_columns[i]);
+        }
+        return add_columns;
     }
 
     @Override
@@ -36,26 +158,11 @@ public class ClickHouseSqlSink extends RichSinkFunction<String> implements Check
         super.open(parameters);
         //获取CK数据库连接
         connection = ClickHouseUtils.getConnection(this._ck_host, this._db, this._username, this._password);
-
-        String sql;
-        if (this._topic.contains("sls-k8s-audit")){
-            sql = "insert into " + this._topic.replace("-","_") +"_distributed (tag_pod_name_,tag_container_name_,annotations," +
-                    "tag_pod_uid_,tag_container_ip_,apiVersion,__pack_meta__,tag_namespace_,tag__pack_id__,auditID," +
-                    "requestReceivedTimestamp,__time__,objectRef,__topic__,level,kind,__source__,verb,tag__user_defined_id__," +
-                    "userAgent,requestURI,responseStatus,stageTimestamp,sourceIPs,tag__hostname__,stage,tag_audit,tag_node_ip_," +
-                    "tag_image_name_,user,tag__path__,tag_node_name_) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-        } else if (this._topic.contains("sls-nginx-ingress")) {
-            sql = "insert into " + this._topic.replace("-","_") +"_distributed (_time_,upstream_addr,body_bytes_sent,http_user_agent,remote_user," +
-                    "req_id,upstream_status,request_time,_container_ip_,host,client_ip,_pod_name_,_image_name_,_container_name_,method," +
-                    "_namespace_,upstream_response_length,_source_,version,x_forward_for,url,request_length,http_referer,_pod_uid_," +
-                    "proxy_upstream_name,upstream_response_time,time,status) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
-        } else {
-            sql = "insert into " + this._topic.replace("-","_") +"_distributed (timestamp,kubernetes_container_name,kubernetes_host," +
-                    "kubernetes_namespace_name,kubernetes_pod_name,message,stream,tag) values (?,?,?,?,?,?,?,?);";
-        }
-
-        ps = connection.prepareStatement(sql);
+        connection.setAutoCommit(false);
+//        String sql = "insert into gz_local_xpu_k8s_cluster_k8s_log_1 values(?,?,?,?,?,?,?,?)";
+//        ps = connection.prepareStatement(sql);
     }
+
     @Override
     public void close() throws Exception {
         super.close();
@@ -69,10 +176,10 @@ public class ClickHouseSqlSink extends RichSinkFunction<String> implements Check
 
     }
 
-    // 只在数据到达sink算子时，才会被触发
+    //  只在数据到达sink算子时，才会被触发
     @Override
     public void invoke(String value, Context context) throws Exception {
-        Gson gson = new Gson();
+//        Gson gson = new Gson();
         value = value.replace("__tag__:","tag");
         JsonObject jsonObject = new JsonParser().parse(value).getAsJsonObject();
         JsonObject k8s_log_sub_json = jsonObject.getAsJsonObject("kubernetes");
@@ -80,121 +187,69 @@ public class ClickHouseSqlSink extends RichSinkFunction<String> implements Check
         boolean k8s_ingress_log_sub_json = jsonObject.has("upstream_addr");
 
         if (k8s_log_sub_json != null){
-            System.out.println("===k8s_log===");
-            if (i <= count) {
-                for (Map.Entry<String, JsonElement> stringJsonElementEntry : k8s_log_sub_json.entrySet()) {
-                    String tmp_key = "kubernetes_" + ((Map.Entry<?, ?>) stringJsonElementEntry).getKey();
-                    jsonObject.add(tmp_key, (JsonElement) ((Map.Entry<?, ?>) stringJsonElementEntry).getValue());
-                }
-                jsonObject.remove("kubernetes");
-                k8s_log k8slogdata = gson.fromJson(jsonObject.toString(), k8s_log.class);
-//                k8s_log k8slogdata = JSONObject.parseObject(jsonObject.toString(), k8s_log.class);
-                ps.setTimestamp(1, new java.sql.Timestamp(k8slogdata.getTimestamp().getTime()));
-                ps.setString(2, k8slogdata.getKubernetes_container_name());
-                ps.setString(3, k8slogdata.getKubernetes_host());
-                ps.setString(4, k8slogdata.getKubernetes_namespace_name());
-                ps.setString(5, k8slogdata.getKubernetes_pod_name());
-                ps.setString(6, k8slogdata.getMessage());
-                ps.setString(7, k8slogdata.getStream());
-                ps.setString(8, k8slogdata.getTag());
-                ps.addBatch();
-                i++;
+            for (Map.Entry<String, JsonElement> stringJsonElementEntry : k8s_log_sub_json.entrySet()) {
+                String tmp_key = "kubernetes_" + ((Map.Entry<?, ?>) stringJsonElementEntry).getKey();
+                jsonObject.add(tmp_key, (JsonElement) ((Map.Entry<?, ?>) stringJsonElementEntry).getValue());
             }
+            jsonObject.remove("kubernetes");
         } else if (k8s_audit_log_sub_json){
-            System.out.println("---k8s_audit_log---");
-            if (j <= count) {
-                sls_k8s_audit_log k8sAuditLoglogdata = gson.fromJson(jsonObject.toString(), sls_k8s_audit_log.class);
-//                sls_k8s_audit_log k8sAuditLoglogdata = JSONObject.parseObject(jsonObject.toString(), sls_k8s_audit_log.class);
-                ps.setString(1, k8sAuditLoglogdata.getTag_pod_name_());
-                ps.setString(2, k8sAuditLoglogdata.getTag_container_name_());
-                ps.setString(3, k8sAuditLoglogdata.getAnnotations());
-                ps.setString(4, k8sAuditLoglogdata.getTag_pod_uid_());
-                ps.setString(5, k8sAuditLoglogdata.getTag_container_ip_());
-                ps.setString(6, k8sAuditLoglogdata.getApiVersion());
-                ps.setString(7, k8sAuditLoglogdata.get__pack_meta__());
-                ps.setString(8, k8sAuditLoglogdata.getTag_namespace_());
-                ps.setString(9, k8sAuditLoglogdata.getTag__pack_id__());
-                ps.setString(10, k8sAuditLoglogdata.getAuditID());
-                ps.setTimestamp(11, new java.sql.Timestamp(k8sAuditLoglogdata.getRequestReceivedTimestamp().getTime()));
-                ps.setInt(12, k8sAuditLoglogdata.get__time__());
-                ps.setString(13, k8sAuditLoglogdata.getObjectRef());
-                ps.setString(14, k8sAuditLoglogdata.get__topic__());
-                ps.setString(15, k8sAuditLoglogdata.getLevel());
-                ps.setString(16, k8sAuditLoglogdata.getKind());
-                ps.setString(17, k8sAuditLoglogdata.get__source__());
-                ps.setString(18, k8sAuditLoglogdata.getVerb());
-                ps.setString(19, k8sAuditLoglogdata.getTag__user_defined_id__());
-                ps.setString(20, k8sAuditLoglogdata.getUserAgent());
-                ps.setString(21, k8sAuditLoglogdata.getRequestURI());
-                ps.setString(22, k8sAuditLoglogdata.getResponseStatus());
-                ps.setTimestamp(23, new java.sql.Timestamp(k8sAuditLoglogdata.getStageTimestamp().getTime()));
-                ps.setArray(24, connection.createArrayOf("Array(String)", k8sAuditLoglogdata.getSourceIPs()));
-                ps.setString(25, k8sAuditLoglogdata.getTag__hostname__());
-                ps.setString(26, k8sAuditLoglogdata.getStage());
-                ps.setString(27, k8sAuditLoglogdata.getTag_audit());
-                ps.setString(28, k8sAuditLoglogdata.getTag_node_ip_());
-                ps.setString(29, k8sAuditLoglogdata.getTag_image_name_());
-                ps.setString(30, k8sAuditLoglogdata.getUser());
-                ps.setString(31, k8sAuditLoglogdata.getTag__path__());
-                ps.setString(32, k8sAuditLoglogdata.getTag_node_name_());
-                ps.addBatch();
-                j++;
-            }
+            System.out.println("k8s_audit_log");
         } else if (k8s_ingress_log_sub_json){
-            System.out.println("+++k8s_ingress_log+++");
-            if (k <= count) {
-                sls_nginx_ingress_k8s_log k8singresslogdata = gson.fromJson(jsonObject.toString(), sls_nginx_ingress_k8s_log.class);
-//                sls_nginx_ingress_k8s_log k8singresslogdata = JSONObject.parseObject(jsonObject.toString(), sls_nginx_ingress_k8s_log.class);
-                ps.setTimestamp(1, new java.sql.Timestamp(k8singresslogdata.get_time_().getTime()));
-                ps.setString(2, k8singresslogdata.getUpstream_addr());
-                ps.setInt(3, k8singresslogdata.getBody_bytes_sent());
-                ps.setString(4, k8singresslogdata.getHttp_user_agent());
-                ps.setString(5, k8singresslogdata.getRemote_user());
-                ps.setString(6, k8singresslogdata.getReq_id());
-                ps.setInt(7, k8singresslogdata.getUpstream_status());
-                ps.setFloat(8, k8singresslogdata.getRequest_time());
-                ps.setString(9, k8singresslogdata.get_container_ip_());
-                ps.setString(10, k8singresslogdata.getHost());
-                ps.setString(11, k8singresslogdata.getClient_ip());
-                ps.setString(12, k8singresslogdata.get_pod_name_());
-                ps.setString(13, k8singresslogdata.get_image_name_());
-                ps.setString(14, k8singresslogdata.get_container_name_());
-                ps.setString(15, k8singresslogdata.getMethod());
-                ps.setString(16, k8singresslogdata.get_namespace_());
-                ps.setInt(17, k8singresslogdata.getUpstream_response_length());
-                ps.setString(18, k8singresslogdata.get_source_());
-                ps.setString(19, k8singresslogdata.getVersion());
-                ps.setString(20, k8singresslogdata.getX_forward_for());
-                ps.setString(21, k8singresslogdata.getUrl());
-                ps.setInt(22, k8singresslogdata.getRequest_length());
-                ps.setString(23, k8singresslogdata.getHttp_referer());
-                ps.setString(24, k8singresslogdata.get_pod_uid_());
-                ps.setString(25, k8singresslogdata.getProxy_upstream_name());
-                ps.setFloat(26, k8singresslogdata.getUpstream_response_time());
-                ps.setString(27, k8singresslogdata.getTime());
-                ps.setInt(28, k8singresslogdata.getStatus());
-                ps.addBatch();
-                k++;
-            }
+            System.out.println("k8s_ingress_log");
         } else {
-            System.out.println("日志内容或者格式不符合CK表格式，请检查！\n" + value);
+            System.out.println("other logs");
+        }
+
+        String table_name = (jsonObject.get("zone").toString() + "_" + jsonObject.get("cluster").toString() + "_" +
+                jsonObject.get("log_type").toString() + "_" + jsonObject.get("log_format").toString()).replace("-","_").replace("\"", "");
+        String sql = "insert into " + table_name + " values(?,?,?,?,?,?,?,?)";
+        ps = connection.prepareStatement(sql); // 是否会导致过多连接和资源不释放而堆积，导致未知问题
+
+        Set<Map.Entry<String, JsonElement>> keySet = jsonObject.entrySet();
+        Iterator<Map.Entry<String, JsonElement>> iterator = keySet.iterator();
+        int index = 0;
+        String[] arraykey = new String[keySet.size()], arrayvalue = new String[keySet.size()];
+        while(iterator.hasNext()) {
+            Map.Entry<String, JsonElement> k_v = iterator.next();
+            arraykey[index] = k_v.getKey().replace("@","");
+            arrayvalue[index] = String.valueOf(k_v.getValue());
+//            System.out.println(arraykey[index]);
+//            System.out.println(arrayvalue[index]);
+            index++;
+        }
+//        System.out.println(table_name);
+        if (!checkTable(table_name)){
+            System.out.println("create table and view");
+            createTableandView(table_name, arraykey);
+        }
+
+        String[] orgin_columns = queryColumns(table_name + "_view");
+        String[] add_columns = arraySubtract(arraykey, orgin_columns);
+        System.out.println("add columns: " + Arrays.toString(add_columns));
+        if ( add_columns.length != 0 ) {
+            updatedView(table_name, orgin_columns, add_columns);
+        }
+
+        if (i <= count) {
+            ps.setTimestamp(1, new java.sql.Timestamp(new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss").parse(jsonObject.get("_time").toString().replace("\"","")).getTime()));
+            ps.setString(2, String.valueOf(jsonObject.get("zone")));
+            ps.setString(3, String.valueOf(jsonObject.get("cluster")));
+            ps.setString(4, String.valueOf(jsonObject.get("log_format")));
+            ps.setString(5, String.valueOf(jsonObject.get("log_type")));
+            ps.setString(6, String.valueOf(jsonObject.get("instance")));
+            ps.setArray(7, connection.createArrayOf("Array(String)", arraykey));
+            ps.setArray(8, connection.createArrayOf("Array(String)", arrayvalue));
+            ps.addBatch();
+            i++;
         }
 
         //攒够10w条数据写入CK。
         if (i >= count) {
             ps.executeBatch();
-            System.out.println(String.format("k8s_log to execute Batch for %d records ...", i));
+            connection.commit();
+            ps.clearBatch();
+            System.out.printf("To execute Batch for %d records ...%n", i);
             i = 0;
-        }
-        if (j >= count) {
-            ps.executeBatch();
-            System.out.println(String.format("k8s_audit_log to execute Batch for %d records ...", j));
-            j = 0;
-        }
-        if (k >= count) {
-            ps.executeBatch();
-            System.out.println(String.format("k8s_ingress_log to execute Batch for %d records ...", k));
-            k = 0;
         }
     }
 
@@ -208,9 +263,9 @@ public class ClickHouseSqlSink extends RichSinkFunction<String> implements Check
     @Override
     public void snapshotState(FunctionSnapshotContext functionSnapshotContext) throws Exception {
         ps.executeBatch();
+        connection.commit();
+        ps.clearBatch();
         i = 0;
-        j = 0;
-        k = 0;
         System.out.println("Time to execute Batch for 30s timer done ...");
     }
 

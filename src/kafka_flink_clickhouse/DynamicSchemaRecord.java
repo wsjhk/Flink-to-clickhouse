@@ -2,7 +2,7 @@ package kafka_flink_clickhouse;
 
 
 public class DynamicSchemaRecord<T> {
-    private T value;
+    private final T value;
 
     public DynamicSchemaRecord(T value) {
         this.value = value;

@@ -10,7 +10,7 @@
       </profile>
     </annotationProcessing>
     <bytecodeTargetLevel>
-      <module name="Flink-Log-System-Job" target="8" />
+      <module name="Flink-Log-System-Job" target="1.8" />
     </bytecodeTargetLevel>
   </component>
 </project>
